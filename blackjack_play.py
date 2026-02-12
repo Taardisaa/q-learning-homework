@@ -2,6 +2,7 @@ import gymnasium as gym
 
 env = gym.make("Blackjack-v1", render_mode="human")
 obs, info = env.reset()
+print(obs, info)
 done = False
 
 while not done:
