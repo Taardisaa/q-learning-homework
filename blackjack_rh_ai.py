@@ -112,7 +112,7 @@ class RandomAgent:
 
 def train(alpha: float, gamma: float, epsilon: float, final_epsilon: float, label: str,
           exploration: str = "epsilon_greedy", tau: float = 1.0, final_tau: float = 0.1):
-    epsilon_decay = epsilon / (EPISODES / 2)
+    epsilon_decay = (epsilon - final_epsilon) / (EPISODES / 2) if exploration == "epsilon_greedy" else 0.0
     tau_decay = (tau - final_tau) / (EPISODES / 2) if exploration == "boltzmann" else 0.0
     agent = QLearningAgent(
         alpha=alpha, gamma=gamma, epsilon=epsilon,
