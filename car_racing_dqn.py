@@ -25,6 +25,8 @@ import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True  # auto-tune conv kernels for fixed input size
 
 
 # ── Environment ──────────────────────────────────────────────────────
@@ -117,7 +119,7 @@ class CNNDQN(nn.Module):
 
 # ── Hyperparameters ──────────────────────────────────────────────────
 
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 GAMMA = 0.99
 EPS_START = 1.0
 EPS_END = 0.05
@@ -126,9 +128,13 @@ TAU = 0.005             # soft target update rate
 LR = 1e-4
 N_FRAMES = 4
 MEMORY_SIZE = 50000
+OPTIMIZE_EVERY = 4      # optimize every N env steps
+PLOT_EVERY = 10         # plot every N episodes
 
-SAVE_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
-CHECKPOINT_PATH = os.path.join(SAVE_DIR, "car_racing_cnn_dqn.pt")
+BASE_DIR = os.path.dirname(__file__)
+RESULTS_DIR = os.path.join(BASE_DIR, "results", "car_racing")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+CHECKPOINT_PATH = os.path.join(RESULTS_DIR, "cnn_dqn.pt")
 
 # ── Args ─────────────────────────────────────────────────────────────
 
@@ -151,14 +157,26 @@ target_net = CNNDQN(N_FRAMES, n_actions).to(device)
 optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
 memory = ReplayMemory(MEMORY_SIZE)
 steps_done = 0
+episode_durations = []
+episode_rewards = []
 
 if args.load:
-    checkpoint = torch.load(args.load, map_location=device, weights_only=True)
-    policy_net.load_state_dict(checkpoint["policy_net"])
-    target_net.load_state_dict(checkpoint["target_net"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    steps_done = checkpoint["steps_done"]
+    ckpt = torch.load(args.load, map_location=device, weights_only=True)
+    policy_net.load_state_dict(ckpt["policy_net"])
+    target_net.load_state_dict(ckpt["target_net"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    steps_done = ckpt["steps_done"]
     print(f"Loaded checkpoint from {args.load} (steps_done={steps_done})")
+elif os.path.exists(CHECKPOINT_PATH):
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
+    policy_net.load_state_dict(ckpt["policy_net"])
+    target_net.load_state_dict(ckpt["target_net"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    steps_done = ckpt["steps_done"]
+    episode_durations = ckpt.get("episode_durations", [])
+    episode_rewards = ckpt.get("episode_rewards", [])
+    print(f"Loaded checkpoint from {CHECKPOINT_PATH} (steps_done={steps_done})")
+    print(f"Skipping training — checkpoint already exists. Delete it to retrain.")
 else:
     target_net.load_state_dict(policy_net.state_dict())
 
@@ -177,40 +195,103 @@ def select_action(state):
         return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
 
 
+# ── Random baseline evaluation ───────────────────────────────────────
+
+def evaluate_random(num_episodes=50):
+    """Run random policy to get baseline duration and reward."""
+    env_eval = make_env()
+    durations, rewards = [], []
+    for _ in range(num_episodes):
+        obs, _ = env_eval.reset()
+        ep_reward = 0.0
+        for t in count():
+            action = env_eval.action_space.sample()
+            obs, reward, terminated, truncated, _ = env_eval.step(action)
+            ep_reward += reward
+            if terminated or truncated:
+                durations.append(t + 1)
+                rewards.append(ep_reward)
+                break
+    env_eval.close()
+    return np.mean(durations), np.mean(rewards)
+
+
 # ── Plotting ─────────────────────────────────────────────────────────
 
-episode_durations = []
-episode_rewards = []
-
-
-def plot_durations(show_result=False):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), num=1)
-    if not show_result:
-        ax1.cla()
-        ax2.cla()
-
-    durations_t = torch.tensor(episode_durations, dtype=torch.float)
-    ax1.set_title('Result - Duration' if show_result else 'Training - Duration')
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Duration')
-    ax1.plot(durations_t.numpy(), color='green', alpha=0.6)
-    if len(durations_t) >= 20:
-        means = durations_t.unfold(0, 20, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(19), means))
-        ax1.plot(means.numpy(), color='red')
-
-    rewards_t = torch.tensor(episode_rewards, dtype=torch.float)
-    ax2.set_title('Result - Reward' if show_result else 'Training - Reward')
-    ax2.set_xlabel('Episode')
-    ax2.set_ylabel('Total Reward')
-    ax2.plot(rewards_t.numpy(), color='green', alpha=0.6)
-    if len(rewards_t) >= 20:
-        means = rewards_t.unfold(0, 20, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(19), means))
-        ax2.plot(means.numpy(), color='red')
-
+def plot_training_live():
+    """Quick live plot during training (reuses figure 1)."""
+    plt.figure(1)
+    plt.clf()
+    rew = np.array(episode_rewards, dtype=np.float32)
+    plt.plot(rew, alpha=0.3, color='steelblue', linewidth=0.8)
+    w = 20
+    if len(rew) >= w:
+        smooth = np.convolve(rew, np.ones(w) / w, mode='valid')
+        plt.plot(np.arange(w - 1, len(rew)), smooth, color='navy', linewidth=1.5)
+    plt.title('CNN DQN – Car Racing (training)')
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.pause(0.001)
+
+
+def plot_final_chart(ep_rewards, random_reward, save_path):
+    """Generate publication-quality final chart."""
+    matplotlib.rcParams.update({'font.size': 11})
+    rew = np.array(ep_rewards, dtype=np.float64)
+    n = len(rew)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig.suptitle('CNN DQN — Car Racing (CarRacing-v3, 5 discrete actions)',
+                 fontsize=14, fontweight='bold')
+
+    # ── Left panel: reward over training with smoothing ──
+    ax1.plot(rew, alpha=0.15, color='#90CAF9', linewidth=0.6, label='Per episode')
+    for w, color, lw, alpha in [(20, '#42A5F5', 1.2, 0.5),
+                                 (50, '#1565C0', 2.0, 0.9)]:
+        if n >= w:
+            smooth = np.convolve(rew, np.ones(w) / w, mode='valid')
+            ax1.plot(np.arange(w - 1, n), smooth,
+                     color=color, linewidth=lw, alpha=alpha,
+                     label=f'{w}-episode moving avg')
+
+    ax1.axhline(random_reward, color='#E53935', linestyle='--', linewidth=1.5,
+                label=f'Random policy ({random_reward:.1f})')
+    ax1.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.5)
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Total Reward')
+    ax1.set_title('Total Reward Per Episode')
+    ax1.legend(loc='upper left', fontsize=9, framealpha=0.9)
+    ax1.grid(True, alpha=0.25)
+
+    # ── Right panel: reward distribution (first 100 vs last 100) ──
+    first_n = min(100, n // 3)
+    last_n = min(100, n // 3)
+
+    first_chunk = rew[:first_n]
+    last_chunk = rew[-last_n:]
+
+    bins = np.linspace(min(rew.min(), random_reward - 20),
+                       max(rew.max(), 50), 35)
+
+    ax2.hist(first_chunk, bins=bins, alpha=0.5, color='#EF9A9A', edgecolor='#E57373',
+             label=f'First {first_n} episodes (μ={first_chunk.mean():.1f})')
+    ax2.hist(last_chunk, bins=bins, alpha=0.6, color='#81C784', edgecolor='#66BB6A',
+             label=f'Last {last_n} episodes (μ={last_chunk.mean():.1f})')
+    ax2.axvline(random_reward, color='#E53935', linestyle='--', linewidth=1.5,
+                label=f'Random policy ({random_reward:.1f})')
+    ax2.axvline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.5)
+    ax2.set_xlabel('Total Reward')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Reward Distribution: Early vs Late Training')
+    ax2.legend(loc='upper left', fontsize=9, framealpha=0.9)
+    ax2.grid(True, alpha=0.25, axis='y')
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Chart saved to {save_path}")
+    return fig
 
 
 # ── Optimize ─────────────────────────────────────────────────────────
@@ -249,6 +330,8 @@ def optimize_model():
 
 # ── Training loop ────────────────────────────────────────────────────
 
+skip_training = os.path.exists(CHECKPOINT_PATH) and not args.load
+
 if args.episodes:
     num_episodes = args.episodes
 elif torch.cuda.is_available():
@@ -258,60 +341,71 @@ else:
     print("Using CPU for training.")
     num_episodes = 30
 
-for i_episode in tqdm(range(num_episodes), desc="Training"):
-    obs, info = env.reset()
-    state = frame_stack.reset(obs)
-    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+if not skip_training:
+    for i_episode in tqdm(range(num_episodes), desc="Training"):
+        obs, info = env.reset()
+        state = frame_stack.reset(obs)
+        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
 
-    ep_reward = 0.0
-    for t in count():
-        action = select_action(state)
-        next_obs, reward, terminated, truncated, info = env.step(action.item())
-        ep_reward += reward
-        reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
+        ep_reward = 0.0
+        for t in count():
+            action = select_action(state)
+            next_obs, reward, terminated, truncated, info = env.step(action.item())
+            ep_reward += reward
+            reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
 
-        done = terminated or truncated
-        if done:
-            next_state = None
-        else:
-            next_state = frame_stack.step(next_obs)
-            next_state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
+            done = terminated or truncated
+            if done:
+                next_state = None
+            else:
+                next_state = frame_stack.step(next_obs)
+                next_state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
 
-        memory.push(state, action, next_state, reward_tensor)
-        state = next_state
+            memory.push(state, action, next_state, reward_tensor)
+            state = next_state
 
-        optimize_model()
+            # Optimize and update target net every N steps
+            if t % OPTIMIZE_EVERY == 0:
+                optimize_model()
 
-        # Soft update target network
-        target_net_state_dict = target_net.state_dict()
-        policy_net_state_dict = policy_net.state_dict()
-        for key in policy_net_state_dict:
-            target_net_state_dict[key] = policy_net_state_dict[key] * TAU + \
-                                         target_net_state_dict[key] * (1 - TAU)
-        target_net.load_state_dict(target_net_state_dict)
+                target_net_state_dict = target_net.state_dict()
+                policy_net_state_dict = policy_net.state_dict()
+                for key in policy_net_state_dict:
+                    target_net_state_dict[key] = policy_net_state_dict[key] * TAU + \
+                                                 target_net_state_dict[key] * (1 - TAU)
+                target_net.load_state_dict(target_net_state_dict)
 
-        if done:
-            episode_durations.append(t + 1)
-            episode_rewards.append(ep_reward)
-            plot_durations()
-            break
+            if done:
+                episode_durations.append(t + 1)
+                episode_rewards.append(ep_reward)
+                if i_episode % PLOT_EVERY == 0:
+                    plot_training_live()
+                break
 
-print('Complete')
+    print('Training complete')
 
-# Save checkpoint
-os.makedirs(SAVE_DIR, exist_ok=True)
-torch.save({
-    "policy_net": policy_net.state_dict(),
-    "target_net": target_net.state_dict(),
-    "optimizer": optimizer.state_dict(),
-    "steps_done": steps_done,
-}, CHECKPOINT_PATH)
-print(f"Model saved to {CHECKPOINT_PATH}")
+    # Save checkpoint with training metrics
+    torch.save({
+        "policy_net": policy_net.state_dict(),
+        "target_net": target_net.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "steps_done": steps_done,
+        "episode_durations": episode_durations,
+        "episode_rewards": episode_rewards,
+    }, CHECKPOINT_PATH)
+    print(f"Checkpoint saved to {CHECKPOINT_PATH}")
 
-# Save final chart
-plot_durations(show_result=True)
-chart_path = os.path.join(os.path.dirname(__file__), "car_racing_results.png")
-plt.savefig(chart_path, dpi=150, bbox_inches="tight")
-print(f"Chart saved to {chart_path}")
+# Save final chart (always regenerated)
+if episode_rewards:
+    print("Evaluating random baseline (50 episodes)...")
+    rand_dur, rand_rew = evaluate_random(num_episodes=50)
+    print(f"  Random baseline => duration: {rand_dur:.0f}, reward: {rand_rew:.1f}")
+    chart_path = os.path.join(RESULTS_DIR, "cnn_dqn.png")
+    plot_final_chart(episode_rewards, rand_rew, chart_path)
+else:
+    print("No training metrics available — cannot generate charts.")
+
+env.close()
+print(f"Done! All results saved to {RESULTS_DIR}")
 plt.ioff()
 plt.show()

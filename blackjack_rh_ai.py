@@ -13,8 +13,8 @@ import tqdm
 
 
 EPISODES = 100000  # each episode is a round in the game. Set to a big number to let it learn a lot.
-EVAL_INTERVAL = 100  # evaluate every N training episodes
-EVAL_EPISODES = 100   # number of games per evaluation
+# EVAL_INTERVAL = 100  # evaluate every N training episodes
+# EVAL_EPISODES = 100   # number of games per evaluation
 
 
 def make_env() -> Tuple[Any, Any, gym.Env]:
@@ -93,21 +93,21 @@ class RandomAgent:
         return random.choice([0, 1])
     
 
-def evaluate(agent, episodes: int = EVAL_EPISODES) -> float:
-    wins = 0
-    for _ in range(episodes):
-        obs, _, env = make_env()
-        done = False
-        while not done:
-            if isinstance(agent, QLearningAgent):
-                # greedy: always pick best action
-                action = 0 if agent._Q[(obs, 0)] >= agent._Q[(obs, 1)] else 1
-            else:
-                action = agent.choose_action(obs)
-            obs, reward, done, _, _ = env.step(action)
-        if reward == 1.0:
-            wins += 1
-    return wins / episodes
+# def evaluate(agent, episodes: int = EVAL_EPISODES) -> float:
+#     wins = 0
+#     for _ in range(episodes):
+#         obs, _, env = make_env()
+#         done = False
+#         while not done:
+#             if isinstance(agent, QLearningAgent):
+#                 # greedy: always pick best action
+#                 action = 0 if agent._Q[(obs, 0)] >= agent._Q[(obs, 1)] else 1
+#             else:
+#                 action = agent.choose_action(obs)
+#             obs, reward, done, _, _ = env.step(action)
+#         if reward == 1.0:
+#             wins += 1
+#     return wins / episodes
 
 
 def train(alpha: float, gamma: float, epsilon: float, final_epsilon: float, label: str,

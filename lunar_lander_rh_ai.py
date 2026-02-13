@@ -1,9 +1,7 @@
 """
 Part 2: DQN for Lunar Lander (LunarLander-v3)
 
-Trains two DQN variants on the same environment and compares them:
-  1. MLP DQN  – learns from the 8-dim state vector (default observation)
-  2. CNN DQN  – learns from pixel observations (rgb_array render mode)
+Trains an MLP DQN on the Lunar Lander environment using the 8-dim state vector.
 
 Results (charts + checkpoints) are saved to results/lunar_lander/.
 """
@@ -42,13 +40,6 @@ def make_env_state():
                     enable_wind=False, wind_power=15.0, turbulence_power=1.5)
 
 
-def make_env_pixel():
-    """Lunar Lander with pixel observations."""
-    return gym.make("LunarLander-v3", continuous=False, gravity=-10.0,
-                    enable_wind=False, wind_power=15.0, turbulence_power=1.5,
-                    render_mode="rgb_array")
-
-
 # ── Replay Memory ────────────────────────────────────────────────────
 
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
@@ -83,60 +74,6 @@ class MLPDQN(nn.Module):
         return self.fc3(x)
 
 
-# ── CNN DQN ──────────────────────────────────────────────────────────
-
-class CNNDQN(nn.Module):
-    """Atari-style CNN DQN operating on stacked grayscale frames."""
-    def __init__(self, n_frames, n_actions):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(n_frames, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-        )
-        # Input 4x84x84 -> conv1: 32x20x20 -> conv2: 64x9x9 -> conv3: 64x7x7 = 3136
-        self.fc = nn.Sequential(
-            nn.Linear(64 * 7 * 7, 512),
-            nn.ReLU(),
-            nn.Linear(512, n_actions),
-        )
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
-
-
-# ── Frame preprocessing (for CNN) ───────────────────────────────────
-
-def preprocess_frame(frame: np.ndarray) -> np.ndarray:
-    """Convert RGB pixel frame to 84x84 grayscale, normalized to [0,1]."""
-    gray = np.dot(frame[:, :, :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
-    # Resize via torch interpolate (fast, no opencv needed)
-    t = torch.from_numpy(gray).unsqueeze(0).unsqueeze(0)  # 1x1xHxW
-    t = F.interpolate(t, size=(84, 84), mode='bilinear', align_corners=False)
-    return t.squeeze().numpy() / 255.0
-
-
-class FrameStack:
-    def __init__(self, n_frames=4):
-        self.n_frames = n_frames
-        self.frames = deque(maxlen=n_frames)
-
-    def reset(self, frame):
-        processed = preprocess_frame(frame)
-        for _ in range(self.n_frames):
-            self.frames.append(processed)
-        return np.array(self.frames, dtype=np.float32)
-
-    def step(self, frame):
-        self.frames.append(preprocess_frame(frame))
-        return np.array(self.frames, dtype=np.float32)
-
-
 # ── Hyperparameters ──────────────────────────────────────────────────
 
 BATCH_SIZE = 128
@@ -146,7 +83,33 @@ EPS_END = 0.01
 EPS_DECAY = 2500
 TAU = 0.005
 LR = 3e-4
-N_FRAMES = 4
+
+
+# ── Random Baseline ─────────────────────────────────────────────────
+
+def evaluate_random_baseline(make_env_fn, num_episodes=100):
+    """Evaluate random policy as baseline."""
+    env = make_env_fn()
+    ep_durations = []
+    ep_rewards = []
+    
+    print(f"  Evaluating random baseline over {num_episodes} episodes...")
+    for ep in tqdm(range(num_episodes), desc="Random Baseline"):
+        obs, info = env.reset()
+        ep_reward = 0.0
+        
+        for t in count():
+            action = env.action_space.sample()  # random action
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_reward += reward
+            
+            if terminated or truncated:
+                ep_durations.append(t + 1)
+                ep_rewards.append(ep_reward)
+                break
+    
+    env.close()
+    return ep_durations, ep_rewards
 
 
 # ── Generic training function ────────────────────────────────────────
@@ -171,18 +134,21 @@ def train_dqn(label, make_env_fn, build_net_fn, state_transform_fn,
     memory = ReplayMemory(100000)
     steps_done = 0
 
-    # Skip training if checkpoint already exists
+    # Skip training if checkpoint already exists, but load metrics for chart regeneration
     ckpt_path = os.path.join(RESULTS_DIR, checkpoint_name)
     if os.path.exists(ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         policy_net.load_state_dict(checkpoint["policy_net"])
         target_net.load_state_dict(checkpoint["target_net"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         steps_done = checkpoint["steps_done"]
+        ep_durations = checkpoint.get("episode_durations", [])
+        ep_rewards = checkpoint.get("episode_rewards", [])
         print(f"  Loaded checkpoint from {ckpt_path} (steps_done={steps_done})")
         print(f"  Skipping training — checkpoint already exists. Delete it to retrain.")
+        print(f"  Regenerating charts from saved metrics...")
         env.close()
-        return [], []
+        return ep_durations, ep_rewards
 
     ep_durations = []
     ep_rewards = []
@@ -256,13 +222,15 @@ def train_dqn(label, make_env_fn, build_net_fn, state_transform_fn,
 
     env.close()
 
-    # Save checkpoint
+    # Save checkpoint with training metrics
     ckpt_path = os.path.join(RESULTS_DIR, checkpoint_name)
     torch.save({
         "policy_net": policy_net.state_dict(),
         "target_net": target_net.state_dict(),
         "optimizer": optimizer.state_dict(),
         "steps_done": steps_done,
+        "episode_durations": ep_durations,
+        "episode_rewards": ep_rewards,
     }, ckpt_path)
     print(f"  Checkpoint saved to {ckpt_path}")
 
@@ -271,30 +239,60 @@ def train_dqn(label, make_env_fn, build_net_fn, state_transform_fn,
 
 # ── Plotting ─────────────────────────────────────────────────────────
 
-def plot_single(durations, rewards, title, filename):
+def plot_single(durations, rewards, title, filename, baseline_avg_dur=None, baseline_avg_rew=None):
     """Save a 2-panel (duration + reward) chart for one agent."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(title)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
 
     dur_t = torch.tensor(durations, dtype=torch.float)
-    ax1.set_xlabel('Episode'); ax1.set_ylabel('Duration')
+    ax1.set_title('Episode Duration Over Training', fontsize=11, pad=10)
+    ax1.set_xlabel('Episode', fontsize=10)
+    ax1.set_ylabel('Duration (steps)', fontsize=10)
     ax1.plot(dur_t.numpy(), color='green', alpha=0.6, label='raw')
     if len(dur_t) >= 20:
         m = dur_t.unfold(0, 20, 1).mean(1).view(-1)
         m = torch.cat((torch.zeros(19), m))
         ax1.plot(m.numpy(), color='red', label='20-ep avg')
+    if baseline_avg_dur is not None:
+        ax1.axhline(y=baseline_avg_dur, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
+                    label=f'Random baseline ({baseline_avg_dur:.0f})')
     ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Subcaption for duration chart
+    duration_caption = ('Number of timesteps the agent survived per episode.\n'
+                       'Successful landing terminates early with high reward,\n'
+                       'while crashes or time limits end with lower rewards.\n'
+                       'Trend shows learning efficiency and policy stability.')
+    ax1.text(0.5, -0.25, duration_caption, transform=ax1.transAxes, 
+             fontsize=9, ha='center', va='top', style='italic',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
 
     rew_t = torch.tensor(rewards, dtype=torch.float)
-    ax2.set_xlabel('Episode'); ax2.set_ylabel('Total Reward')
+    ax2.set_title('Total Reward Per Episode', fontsize=11, pad=10)
+    ax2.set_xlabel('Episode', fontsize=10)
+    ax2.set_ylabel('Total Reward', fontsize=10)
     ax2.plot(rew_t.numpy(), color='green', alpha=0.6, label='raw')
     if len(rew_t) >= 20:
         m = rew_t.unfold(0, 20, 1).mean(1).view(-1)
         m = torch.cat((torch.zeros(19), m))
         ax2.plot(m.numpy(), color='red', label='20-ep avg')
+    if baseline_avg_rew is not None:
+        ax2.axhline(y=baseline_avg_rew, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
+                    label=f'Random baseline ({baseline_avg_rew:.0f})')
     ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Subcaption for reward chart
+    reward_caption = ('Cumulative reward obtained during episode.\n'
+                     'Rewards: +100 for landing, -100 for crashing,\n'
+                     'negative for fuel usage, penalties for tilting.\n'
+                     'Environment solved when avg ≥ 200 over 100 episodes.')
+    ax2.text(0.5, -0.25, reward_caption, transform=ax2.transAxes, 
+             fontsize=9, ha='center', va='top', style='italic',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.08, 1, 0.96])
     path = os.path.join(RESULTS_DIR, filename)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     print(f"  Chart saved to {path}")
@@ -304,18 +302,31 @@ def plot_single(durations, rewards, title, filename):
 def plot_comparison(all_results):
     """Save a combined reward comparison chart for all agents."""
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_title("Lunar Lander: MLP DQN vs CNN DQN – Reward")
-    ax.set_xlabel("Episode"); ax.set_ylabel("Total Reward (20-ep avg)")
+    ax.set_title("Lunar Lander: MLP DQN vs Random Baseline – Learning Performance", 
+                 fontsize=14, fontweight='bold', pad=15)
+    ax.set_xlabel("Episode", fontsize=11)
+    ax.set_ylabel("Total Reward (20-episode moving average)", fontsize=11)
 
     for label, _, rewards in all_results:
         rew_t = torch.tensor(rewards, dtype=torch.float)
         if len(rew_t) >= 20:
             m = rew_t.unfold(0, 20, 1).mean(1).view(-1)
-            ax.plot(m.numpy(), label=label)
+            ax.plot(m.numpy(), label=label, linewidth=2)
         else:
-            ax.plot(rew_t.numpy(), label=label)
-    ax.legend()
-    ax.grid(True)
+            ax.plot(rew_t.numpy(), label=label, linewidth=2)
+    
+    ax.axhline(y=200, color='gray', linestyle='--', linewidth=1, alpha=0.7, 
+               label='Solved threshold (200)')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    # Add caption box
+    caption = ('MLP DQN learns from 8-dim state vector\n'
+               'Random baseline takes uniformly random actions\n'
+               'Environment considered solved at avg reward ≥ 200')
+    ax.text(0.02, 0.02, caption, transform=ax.transAxes, fontsize=9,
+            verticalalignment='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.4))
 
     plt.tight_layout()
     path = os.path.join(RESULTS_DIR, "comparison.png")
@@ -330,6 +341,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=None,
                         help="Override episode count (default: 600 GPU, 50 CPU)")
+    parser.add_argument("--visualize", type=int, nargs='?', const=5, default=None,
+                        metavar="N",
+                        help="Watch the trained agent play N episodes (default: 5)")
     args = parser.parse_args()
 
     if args.episodes:
@@ -340,6 +354,17 @@ if __name__ == "__main__":
         num_episodes = 50
 
     all_results = []  # list of (label, durations, rewards)
+
+    # ── 0. Random Baseline ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Evaluating Random Baseline")
+    print("=" * 60)
+    
+    baseline_dur, baseline_rew = evaluate_random_baseline(
+        make_env_fn=make_env_state,
+        num_episodes=100
+    )
+    all_results.append(("Random Baseline", baseline_dur, baseline_rew))
 
     # ── 1. MLP DQN (state-vector observations) ──────────────────────
     print("\n" + "=" * 60)
@@ -368,47 +393,43 @@ if __name__ == "__main__":
         checkpoint_name="mlp_dqn.pt",
     )
     if mlp_dur:
-        plot_single(mlp_dur, mlp_rew, "MLP DQN – Lunar Lander", "mlp_dqn.png")
+        baseline_avg_dur = np.mean(baseline_dur) if baseline_dur else None
+        baseline_avg_rew = np.mean(baseline_rew) if baseline_rew else None
+        plot_single(mlp_dur, mlp_rew, "MLP DQN – Lunar Lander", "mlp_dqn.png",
+                    baseline_avg_dur=baseline_avg_dur, baseline_avg_rew=baseline_avg_rew)
         all_results.append(("MLP DQN", mlp_dur, mlp_rew))
 
-    # ── 2. CNN DQN (pixel observations) ─────────────────────────────
-    print("\n" + "=" * 60)
-    print("Training CNN DQN (pixel observations)")
-    print("=" * 60)
-
-    frame_stack = FrameStack(N_FRAMES)
-
-    def build_cnn():
-        env_tmp = make_env_pixel()
-        n_act = env_tmp.action_space.n
-        env_tmp.close()
-        p = CNNDQN(N_FRAMES, n_act).to(device)
-        t = CNNDQN(N_FRAMES, n_act).to(device)
-        t.load_state_dict(p.state_dict())
-        return p, t
-
-    def cnn_transform(env, obs, reset=False):
-        frame = env.render()  # get pixel frame from rgb_array render mode
-        if reset:
-            stacked = frame_stack.reset(frame)
-        else:
-            stacked = frame_stack.step(frame)
-        return torch.tensor(stacked, dtype=torch.float32, device=device).unsqueeze(0)
-
-    cnn_dur, cnn_rew = train_dqn(
-        label="CNN DQN",
-        make_env_fn=make_env_pixel,
-        build_net_fn=build_cnn,
-        state_transform_fn=cnn_transform,
-        num_episodes=num_episodes,
-        checkpoint_name="cnn_dqn.pt",
-    )
-    if cnn_dur:
-        plot_single(cnn_dur, cnn_rew, "CNN DQN – Lunar Lander", "cnn_dqn.png")
-        all_results.append(("CNN DQN", cnn_dur, cnn_rew))
-
-    # ── 3. Comparison ───────────────────────────────────────────────
+    # ── 2. Comparison ───────────────────────────────────────────────
     if all_results:
         plot_comparison(all_results)
 
     print("\nDone! All results saved to", RESULTS_DIR)
+
+    # ── Visualize trained agent ─────────────────────────────────────
+    if args.visualize:
+        ckpt_path = os.path.join(RESULTS_DIR, "mlp_dqn.pt")
+        if not os.path.exists(ckpt_path):
+            print("No checkpoint found — train first before visualizing.")
+        else:
+            print(f"\nVisualizing trained agent for {args.visualize} episodes...")
+            vis_env = gym.make("LunarLander-v3", continuous=False, gravity=-10.0,
+                              enable_wind=False, wind_power=15.0, turbulence_power=1.5,
+                              render_mode="human")
+            vis_net = MLPDQN(vis_env.observation_space.shape[0], vis_env.action_space.n).to(device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            vis_net.load_state_dict(ckpt["policy_net"])
+            vis_net.eval()
+
+            for ep in range(args.visualize):
+                obs, _ = vis_env.reset()
+                ep_reward = 0.0
+                done = False
+                while not done:
+                    state = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        action = vis_net(state).argmax(dim=1).item()
+                    obs, reward, terminated, truncated, _ = vis_env.step(action)
+                    ep_reward += reward
+                    done = terminated or truncated
+                print(f"  Episode {ep+1}: reward = {ep_reward:.1f}")
+            vis_env.close()
