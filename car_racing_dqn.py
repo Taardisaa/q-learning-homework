@@ -143,6 +143,8 @@ parser.add_argument("--load", type=str, default=None, metavar="PATH",
                     help="Path to a checkpoint to resume from")
 parser.add_argument("--episodes", type=int, default=None,
                     help="Number of episodes to train (default: 500 GPU, 30 CPU)")
+parser.add_argument("--visualize", action="store_true",
+                    help="Load trained model and play one round with graphics")
 args = parser.parse_args()
 
 # ── Setup ────────────────────────────────────────────────────────────
@@ -179,6 +181,57 @@ elif os.path.exists(CHECKPOINT_PATH):
     print(f"Skipping training — checkpoint already exists. Delete it to retrain.")
 else:
     target_net.load_state_dict(policy_net.state_dict())
+
+
+# ── Visualization mode ───────────────────────────────────────────────
+
+if args.visualize:
+    # Ensure we have a trained model
+    if not (args.load or os.path.exists(CHECKPOINT_PATH)):
+        print("Error: No trained model found. Train the model first or specify --load PATH")
+        exit(1)
+
+    # Load checkpoint if not already loaded via args.load
+    if not args.load and os.path.exists(CHECKPOINT_PATH):
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
+        policy_net.load_state_dict(ckpt["policy_net"])
+        print(f"Loaded checkpoint from {CHECKPOINT_PATH} for visualization")
+
+    # Create environment with rendering
+    print("Starting visualization mode...")
+    env_vis = gym.make("CarRacing-v3", continuous=False, render_mode="human")
+    frame_stack_vis = FrameStack(N_FRAMES)
+
+    # Run one episode
+    obs, info = env_vis.reset()
+    state = frame_stack_vis.reset(obs)
+    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+
+    total_reward = 0.0
+    steps = 0
+
+    print("Playing one episode (press Ctrl+C to stop early)...")
+    for t in count():
+        # Use greedy policy (no exploration)
+        with torch.no_grad():
+            action = policy_net(state).argmax(dim=1).item()
+
+        next_obs, reward, terminated, truncated, info = env_vis.step(action)
+        total_reward += reward
+        steps += 1
+
+        done = terminated or truncated
+        if done:
+            break
+
+        next_state = frame_stack_vis.step(next_obs)
+        state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
+
+    env_vis.close()
+    print(f"\nVisualization complete!")
+    print(f"  Steps: {steps}")
+    print(f"  Total reward: {total_reward:.2f}")
+    exit(0)
 
 
 # ── Action selection ─────────────────────────────────────────────────
