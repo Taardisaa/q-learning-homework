@@ -47,6 +47,20 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     return gray.astype(np.float32) / 255.0
 
 
+def dump_preprocess_pair(frame: np.ndarray, output_dir: str, prefix: str = "preprocess_sample"):
+    """Save one raw RGB frame and its preprocessed grayscale frame as PNGs."""
+    os.makedirs(output_dir, exist_ok=True)
+    processed = preprocess_frame(frame)
+
+    input_path = os.path.join(output_dir, f"{prefix}_input.png")
+    output_path = os.path.join(output_dir, f"{prefix}_output.png")
+
+    plt.imsave(input_path, frame.astype(np.uint8))
+    plt.imsave(output_path, processed, cmap="gray", vmin=0.0, vmax=1.0)
+    print(f"Saved preprocess input:  {input_path}")
+    print(f"Saved preprocess output: {output_path}")
+
+
 class FrameStack:
     """Maintains a stack of the last N preprocessed frames."""
     def __init__(self, n_frames: int = 4):
@@ -143,7 +157,16 @@ parser.add_argument("--load", type=str, default=None, metavar="PATH",
                     help="Path to a checkpoint to resume from")
 parser.add_argument("--episodes", type=int, default=None,
                     help="Number of episodes to train (default: 500 GPU, 30 CPU)")
+parser.add_argument("--dump-preprocess", action="store_true",
+                    help="Dump one raw/preprocessed frame pair as PNGs and exit")
 args = parser.parse_args()
+
+if args.dump_preprocess:
+    debug_env = make_env()
+    debug_obs, _ = debug_env.reset()
+    dump_preprocess_pair(debug_obs, RESULTS_DIR)
+    debug_env.close()
+    raise SystemExit(0)
 
 # ── Setup ────────────────────────────────────────────────────────────
 
