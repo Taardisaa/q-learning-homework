@@ -28,6 +28,8 @@ print(f"Using device: {device}")
 if device.type == "cuda":
     torch.backends.cudnn.benchmark = True  # auto-tune conv kernels for fixed input size
 
+USE_AMP = device.type == "cuda"
+
 
 # ── Environment ──────────────────────────────────────────────────────
 
@@ -88,17 +90,48 @@ Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'
 
 
 class ReplayMemory:
-    def __init__(self, capacity):
-        self.memory = deque([], maxlen=capacity)
+    def __init__(self, capacity, n_frames=4, h=84, w=84):
+        self.capacity = capacity
+        self.n_frames = n_frames
+        self.pin = device.type == "cuda"
+        self.states = torch.empty((capacity, n_frames, h, w), dtype=torch.float32, pin_memory=self.pin)
+        self.next_states = torch.empty((capacity, n_frames, h, w), dtype=torch.float32, pin_memory=self.pin)
+        self.actions = torch.empty((capacity, 1), dtype=torch.long, pin_memory=self.pin)
+        self.rewards = torch.empty((capacity,), dtype=torch.float32, pin_memory=self.pin)
+        self.non_final = torch.empty((capacity,), dtype=torch.bool, pin_memory=self.pin)
+        self.position = 0
+        self.size = 0
 
-    def push(self, *args):
-        self.memory.append(Transition(*args))
+    def push(self, state, action, next_state, reward):
+        idx = self.position
+
+        self.states[idx].copy_(torch.from_numpy(state))
+        self.actions[idx, 0] = int(action)
+        self.rewards[idx] = float(reward)
+
+        if next_state is None:
+            self.non_final[idx] = False
+            self.next_states[idx].zero_()
+        else:
+            self.non_final[idx] = True
+            self.next_states[idx].copy_(torch.from_numpy(next_state))
+
+        self.position = (self.position + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+        idx = np.random.choice(self.size, batch_size, replace=False)
+        idx_t = torch.from_numpy(idx).long()
+        return (
+            self.states[idx_t],
+            self.actions[idx_t],
+            self.next_states[idx_t],
+            self.rewards[idx_t],
+            self.non_final[idx_t],
+        )
 
     def __len__(self):
-        return len(self.memory)
+        return self.size
 
 
 # ── CNN DQN ──────────────────────────────────────────────────────────
@@ -157,6 +190,8 @@ parser.add_argument("--load", type=str, default=None, metavar="PATH",
                     help="Path to a checkpoint to resume from")
 parser.add_argument("--episodes", type=int, default=None,
                     help="Number of episodes to train (default: 500 GPU, 30 CPU)")
+parser.add_argument("--visualize-only", action="store_true",
+                    help="Load checkpoint metrics and regenerate charts without training")
 parser.add_argument("--dump-preprocess", action="store_true",
                     help="Dump one raw/preprocessed frame pair as PNGs and exit")
 args = parser.parse_args()
@@ -179,6 +214,8 @@ target_net = CNNDQN(N_FRAMES, n_actions).to(device)
 
 optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
 memory = ReplayMemory(MEMORY_SIZE)
+criterion = nn.SmoothL1Loss()
+scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
 steps_done = 0
 episode_durations = []
 episode_rewards = []
@@ -187,19 +224,24 @@ if args.load:
     ckpt = torch.load(args.load, map_location=device, weights_only=True)
     policy_net.load_state_dict(ckpt["policy_net"])
     target_net.load_state_dict(ckpt["target_net"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    steps_done = ckpt["steps_done"]
+    if not args.visualize_only:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    steps_done = ckpt.get("steps_done", 0)
+    episode_durations = ckpt.get("episode_durations", [])
+    episode_rewards = ckpt.get("episode_rewards", [])
     print(f"Loaded checkpoint from {args.load} (steps_done={steps_done})")
 elif os.path.exists(CHECKPOINT_PATH):
     ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
     policy_net.load_state_dict(ckpt["policy_net"])
     target_net.load_state_dict(ckpt["target_net"])
-    optimizer.load_state_dict(ckpt["optimizer"])
+    if not args.visualize_only:
+        optimizer.load_state_dict(ckpt["optimizer"])
     steps_done = ckpt["steps_done"]
     episode_durations = ckpt.get("episode_durations", [])
     episode_rewards = ckpt.get("episode_rewards", [])
     print(f"Loaded checkpoint from {CHECKPOINT_PATH} (steps_done={steps_done})")
-    print(f"Skipping training — checkpoint already exists. Delete it to retrain.")
+    if not args.load:
+        print(f"Skipping training — checkpoint already exists. Delete it to retrain.")
 else:
     target_net.load_state_dict(policy_net.state_dict())
 
@@ -213,9 +255,10 @@ def select_action(state):
     steps_done += 1
     if random.random() > eps_threshold:
         with torch.no_grad():
-            return policy_net(state).argmax(dim=1).view(1, 1)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=USE_AMP):
+                return policy_net(state).argmax(dim=1).view(1, 1)
     else:
-        return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
+        return torch.randint(n_actions, (1, 1), device=device, dtype=torch.long)
 
 
 # ── Random baseline evaluation ───────────────────────────────────────
@@ -322,38 +365,35 @@ def plot_final_chart(ep_rewards, random_reward, save_path):
 def optimize_model():
     if len(memory) < BATCH_SIZE:
         return
-    transitions = memory.sample(BATCH_SIZE)
-    batch = Transition(*zip(*transitions))
+    state_batch, action_batch, next_state_batch, reward_batch, non_final_mask = memory.sample(BATCH_SIZE)
 
-    non_final_mask = torch.tensor(
-        tuple(map(lambda s: s is not None, batch.next_state)),
-        device=device, dtype=torch.bool)
-    non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
+    state_batch = state_batch.to(device, non_blocking=True)
+    action_batch = action_batch.to(device, non_blocking=True)
+    next_state_batch = next_state_batch.to(device, non_blocking=True)
+    reward_batch = reward_batch.to(device, non_blocking=True)
+    non_final_mask = non_final_mask.to(device, non_blocking=True)
 
-    state_batch = torch.cat(batch.state)
-    action_batch = torch.cat(batch.action)
-    reward_batch = torch.cat(batch.reward)
+    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=USE_AMP):
+        state_action_values = policy_net(state_batch).gather(1, action_batch)
 
-    state_action_values = policy_net(state_batch).gather(1, action_batch)
+        with torch.no_grad():
+            next_q_values = target_net(next_state_batch).max(1).values
+            next_state_values = next_q_values * non_final_mask.float()
 
-    next_state_values = torch.zeros(BATCH_SIZE, device=device)
-    with torch.no_grad():
-        next_state_values[non_final_mask] = target_net(non_final_next_states).max(1).values
+        expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+        loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
 
-    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-
-    criterion = nn.SmoothL1Loss()
-    loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
-
-    optimizer.zero_grad()
-    loss.backward()
+    optimizer.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
-    optimizer.step()
+    scaler.step(optimizer)
+    scaler.update()
 
 
 # ── Training loop ────────────────────────────────────────────────────
 
-skip_training = os.path.exists(CHECKPOINT_PATH) and not args.load
+skip_training = args.visualize_only or (os.path.exists(CHECKPOINT_PATH) and not args.load)
 
 if args.episodes:
     num_episodes = args.episodes
@@ -367,36 +407,31 @@ else:
 if not skip_training:
     for i_episode in tqdm(range(num_episodes), desc="Training"):
         obs, info = env.reset()
-        state = frame_stack.reset(obs)
-        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        state_np = frame_stack.reset(obs)
 
         ep_reward = 0.0
         for t in count():
+            state = torch.from_numpy(state_np).to(device, non_blocking=True).unsqueeze(0)
             action = select_action(state)
             next_obs, reward, terminated, truncated, info = env.step(action.item())
             ep_reward += reward
-            reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
 
             done = terminated or truncated
             if done:
-                next_state = None
+                next_state_np = None
             else:
-                next_state = frame_stack.step(next_obs)
-                next_state = torch.tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
+                next_state_np = frame_stack.step(next_obs)
 
-            memory.push(state, action, next_state, reward_tensor)
-            state = next_state
+            memory.push(state_np, action.item(), next_state_np, reward)
+            state_np = next_state_np
 
             # Optimize and update target net every N steps
             if t % OPTIMIZE_EVERY == 0:
                 optimize_model()
 
-                target_net_state_dict = target_net.state_dict()
-                policy_net_state_dict = policy_net.state_dict()
-                for key in policy_net_state_dict:
-                    target_net_state_dict[key] = policy_net_state_dict[key] * TAU + \
-                                                 target_net_state_dict[key] * (1 - TAU)
-                target_net.load_state_dict(target_net_state_dict)
+                with torch.no_grad():
+                    for target_param, policy_param in zip(target_net.parameters(), policy_net.parameters()):
+                        target_param.lerp_(policy_param, TAU)
 
             if done:
                 episode_durations.append(t + 1)
